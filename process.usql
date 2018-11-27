@@ -1,0 +1,68 @@
+DECLARE EXTERNAL @INPUT_FILE string = "/adlspath/sample4column/sample.json";
+DECLARE EXTERNAL @OUTPUT_FILE string = "/adlspath/sample4column/output.txt";
+DECLARE @REQUEST_DATA_FILE string = "/adlspath/sample4column/request.json";
+
+REFERENCE ASSEMBLY ADLSDB.[Newtonsoft.Json];
+REFERENCE ASSEMBLY ADLSDB.[Microsoft.Analytics.Samples.Formats];
+REFERENCE ASSEMBLY ADLSDB.[DataLakeAnalytics];
+USING Microsoft.Analytics.Samples.Formats.Json;
+
+/* The meta data about the request starts - contents of the file request.json */
+
+@requestData = EXTRACT requestData string FROM @REQUEST_DATA_FILE USING Extractors.Text(delimiter:'\n');
+
+@userRequestDataInDL =  SELECT Microsoft.Analytics.Samples.Formats.Json.JsonFunctions.JsonTuple(requestData) AS userRequestData FROM @requestData;
+@userRequestedIDName =  SELECT userRequestData["IDs"] AS IDs,userRequestData["Names"] AS Names FROM @userRequestDataInDL;
+
+@ids            = SELECT new SQL.ARRAY<string>(IDs.Split(',')) AS IDs FROM @userRequestedIDName ;
+@Names          = SELECT new SQL.ARRAY<string>(Names.Split('$')) AS headingName FROM @userRequestedIDName ;
+
+@NameExploded   = SELECT new SQL.MAP<string, string>(from p in r.headingName select new KeyValuePair<string, string>(r.headingName.Split(':')[0],r.headingName.Split(':')[1])) 
+                  AS NamesMap FROM @Names CROSS APPLY EXPLODE(headingName) AS r(headingName); 
+
+@header = SELECT String.Join(",",NamesMap.Select( p =>  p.Value)) AS Names FROM @NameExploded  WHERE NamesMap.Any(kv => kv.Key.Contains("Consider"));
+@header = SELECT "timestamp" AS time, Names FROM @header;
+/* The request data ends */
+
+//Extract data from adls data from sample.json
+@dataAsStrings = EXTRACT jsonObjStr string FROM @INPUT_FILE USING Extractors.Text(delimiter:'\n');
+
+//Use the JsonTuple function to get the Json Token of the string so it can be parsed later with Json .NET functions    
+@jsonData = SELECT Microsoft.Analytics.Samples.Formats.Json.JsonFunctions.JsonTuple(jsonObjStr) AS adlsData FROM @dataAsStrings;
+
+
+//Selecting  ID, time  value from adls data
+@selectedJsonData = SELECT adlsData["id"] AS id, adlsData["time"] AS timestamp, Microsoft.Analytics.Samples.Formats.Json.JsonFunctions.JsonTuple(adlsData["map"]) AS value FROM @jsonData;
+
+//Extract the fields from the Json object.
+@keyValueData = SELECT id, timestamp, r.key AS key, r.value AS value FROM @selectedJsonData CROSS APPLY EXPLODE(value) AS r(key, value);    
+
+ 
+// Selecting required details of only selected inputs 
+@selectedData =   
+    SELECT e.id AS id , e.timestamp AS timestamp, e.key AS key, e.value AS value
+    FROM @keyValueData AS e
+         INNER JOIN  (SELECT r.Toekn AS r_id FROM @ids CROSS APPLY EXPLODE(IDs) AS r(Toekn)) AS d   
+         ON e.key == d.r_id;
+        ;
+
+//Selecting id, timestamp and a map with key value pair.
+@selectedData = SELECT id, timestamp , key, value AS value FROM @selectedData;
+
+//combine the key value data to the map based on id and timestamp
+@selectedData = SELECT id, timestamp, MAP_AGG(key.Trim(),value) AS idValueData FROM @selectedData  GROUP BY id, timestamp;
+
+//comma seperated result set prepared
+@selectedData =  SELECT id, timestamp, String.Join(",", idValueData.Select( p =>  p.Value)) AS data FROM @selectedData;
+  
+
+//Combining Header and Data
+@selectedData =
+    SELECT * FROM @header
+    UNION ALL
+    SELECT timestamp, data FROM @selectedData;
+
+//Writing the data to Outptut File
+OUTPUT @selectedData  TO @OUTPUT_FILE ORDER BY time DESC USING Outputters.Csv(quoting:false);
+
+
